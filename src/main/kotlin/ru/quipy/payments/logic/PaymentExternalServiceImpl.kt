@@ -7,11 +7,13 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -35,26 +37,42 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(requestAverageProcessingTime.plusSeconds(10).toMillis(), TimeUnit.MILLISECONDS)
+        .build()
     // Используем скользящее для "сглаживания" запросов к внешнему сервису по времени
     private val slidingWindowLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val now = System.currentTimeMillis()
-        val timeoutMillis = maxOf(0, deadline - now)
-        if (!slidingWindowLimiter.tickBlocking(Duration.ofMillis(timeoutMillis))) {
-            logger.warn("[$accountName] Payment $paymentId blocked by rate limiter before sending")
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), UUID.randomUUID(), reason = "blocked by rate limiter before submission")
-            }
-            return
-        }
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+    // Ограничиваем число одновременно выполняемых запросов (blocking window)
+    private val ong = OngoingWindow(parallelRequests)
 
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+        // сначала входим в окно (in-flight лимит)
+        val remainingBeforeWindow = maxOf(0, deadline - System.currentTimeMillis())
+        // ждать у слайдера будем недолго: не дольше остатка дедлайна и средней обработки
+        val waitForSliderMs = minOf(remainingBeforeWindow, requestAverageProcessingTime.toMillis())
+        ong.acquire()
+
+        //коротко ждём у rate-лимитера, чтобы не держать слот окна слишком долго
+        if (!slidingWindowLimiter.tickBlocking(Duration.ofMillis(waitForSliderMs))) {
+            logger.warn("[$accountName] Payment $paymentId blocked by rate limiter after window")
+            // submission как неотправленную
+            paymentESService.update(paymentId) {
+                it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+            // и один раз фиксируем итог обработки
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "blocked by rate limiter after window")
+            }
+            ong.release()
+            return
+        }
+
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        // Submission — только после прохождения обоих ворот (окно + слайдер)
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
@@ -67,7 +85,13 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            //поджимаем вызов под дедлайн
+            val remainingForCall = maxOf(0, deadline - System.currentTimeMillis())
+            val perCallClient = client.newBuilder()
+                .callTimeout(remainingForCall, TimeUnit.MILLISECONDS)
+                .build()
+
+            perCallClient.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
@@ -100,6 +124,10 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        }
+        finally {
+            ong.release()
+            // освобождаем слот семафора
         }
     }
 
