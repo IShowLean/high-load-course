@@ -1,9 +1,8 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Counter
-import ru.quipy.common.utils.SlidingWindowRateLimiter
-import java.time.Duration
+import io.micrometer.core.instrument.Gauge
+import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -13,9 +12,10 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.ceil
+import kotlin.math.max
 
 @Service
 class OrderPayer(
@@ -31,27 +31,40 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    private val queueCapacity = 400
+    private val paymentQueue = LinkedBlockingQueue<Runnable>(queueCapacity)
+
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        16, 16,
+        0L, TimeUnit.MILLISECONDS,
+        paymentQueue,
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
+
+    // ограничение rps внешней системы (взято из графика)
+    private val serviceRps = 10.5
+    // определяем шаг для вызовов
+    private val slotIntervalMs = ceil(1000.0 / serviceRps).toLong()
+    // время обработки одного запроса внешней системой
+    private val serviceProcMs = 1000L
+    // компенсатор
+    private val safetyMs = 400L
+
+    // Следующий доступный слот
+    private val nextSlotMillis = AtomicLong(System.currentTimeMillis())
+
+    private val pacerScheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor(NamedThreadFactory("payment-pacer"))
+
+    private val admitLock = java.util.concurrent.locks.ReentrantLock()
 
     private val acceptedRequestsCounter: Counter = Counter
         .builder("incoming.payments.accepted")
         .register(meterRegistry)
 
-    private val slidingWindowLimiter = SlidingWindowRateLimiter(
-        rate = 11,
-        window = Duration.ofSeconds(1)
-    )
-
     private fun reject(reason: String, retryAfterMillis: Long): Nothing {
-        logger.trace("Rejecting payment due to $reason, retryAfter=${retryAfterMillis}ms")
+        logger.debug("Rejecting payment due to $reason, retryAfter=${retryAfterMillis}ms")
         Counter.builder("incoming.payments.rejected")
             .tag("reason", reason)
             .register(meterRegistry)
@@ -60,27 +73,42 @@ class OrderPayer(
     }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val createdAt = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        val budget = deadline - now
+        if (budget <= 0) reject("deadline", 500)
 
-        when {
-            !slidingWindowLimiter.tick() -> reject("rate_limit", 1000)
-            paymentExecutor.queue.remainingCapacity() == 0 -> reject("queue_full", 1000)
-            else -> acceptedRequestsCounter.increment()
-        }
+        val reservedSlot: Long
+        admitLock.lock()
+        try {
+            val base = max(System.currentTimeMillis(), nextSlotMillis.get())
+            reservedSlot = base
+            // резервируем следующий слот для следующих запросов
+            nextSlotMillis.set(base + slotIntervalMs)
 
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+            // полный прогноз до завершения
+            val totalWaitMs = (reservedSlot - now) + serviceProcMs + safetyMs
+
+            if (totalWaitMs > budget) {
+                val retryAfter = (totalWaitMs - budget + 500).coerceAtLeast(500)
+                reject("queue_wait_exceeds_deadline", retryAfter)
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            acceptedRequestsCounter.increment()
+        } finally {
+            admitLock.unlock()
         }
-        return createdAt
+
+        // Планируем фактическую отправку в зарезервированный момент
+        val delay = max(0L, reservedSlot - System.currentTimeMillis())
+        pacerScheduler.schedule({
+            paymentExecutor.submit {
+                val createdEvent = paymentESService.create { it.create(paymentId, orderId, amount) }
+                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+                paymentService.submitPaymentRequest(paymentId, amount, reservedSlot, deadline)
+            }
+        }, delay, TimeUnit.MILLISECONDS)
+
+        return now
     }
 
     class TooManyRequestsException(val retryAfterMillis: Long) : RuntimeException("Too many incoming requests")
