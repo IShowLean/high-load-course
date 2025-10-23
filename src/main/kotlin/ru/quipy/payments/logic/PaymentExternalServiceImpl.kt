@@ -2,15 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -19,6 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -34,15 +40,64 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val incomingRequestsCounter: Counter = Counter
+        .builder("incoming.requests")
+        .description("Количество завершенных входящих запросов")
+        .tags("account", properties.accountName)
+        .register(meterRegistry)
+    private val incomingFinishedRequestsCounter: Counter = Counter
+        .builder("incoming.finished.requests")
+        .description("Количество завершенных входящих запросов")
+        .tags("account", properties.accountName)
+        .register(meterRegistry)
+    private val outgoingRequestsCounter: Counter = Counter
+        .builder("outgoing.requests")
+        .description("Количество исходящих запросов")
+        .tags("account", properties.accountName)
+        .register(meterRegistry)
+    private val outgoingFinishedRequestsCounter: Counter = Counter
+        .builder("outgoing.finished.requests")
+        .description("Количество завершенных исходящих запросов")
+        .tags("account", properties.accountName)
+        .register(meterRegistry)
+
+    private val client = OkHttpClient.Builder()
+        .readTimeout(requestAverageProcessingTime.plusSeconds(10).toMillis(), TimeUnit.MILLISECONDS)
+        .build()
+    // Используем скользящее для "сглаживания" запросов к внешнему сервису по времени
+    private val slidingWindowLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+
+    // Ограничиваем число одновременно выполняемых запросов (blocking window)
+    private val ong = OngoingWindow(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val transactionId = UUID.randomUUID()
+        incomingRequestsCounter.increment()
+
+        // сначала входим в окно (in-flight лимит)
+        val remainingBeforeWindow = maxOf(0, deadline - System.currentTimeMillis())
+        // ждать у слайдера будем недолго: не дольше остатка дедлайна и средней обработки
+        val waitForSliderMs = minOf(remainingBeforeWindow, requestAverageProcessingTime.toMillis())
+        ong.acquire()
+
+        //коротко ждём у rate-лимитера, чтобы не держать слот окна слишком долго
+        if (!slidingWindowLimiter.tickBlocking(Duration.ofMillis(waitForSliderMs))) {
+            logger.warn("[$accountName] Payment $paymentId blocked by rate limiter after window")
+            // submission как неотправленную
+            paymentESService.update(paymentId) {
+                it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+            // и один раз фиксируем итог обработки
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "blocked by rate limiter after window")
+            }
+            ong.release()
+            return
+        }
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        val transactionId = UUID.randomUUID()
-
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+        // Submission — только после прохождения обоих ворот (окно + слайдер)
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
@@ -50,12 +105,19 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
+            outgoingRequestsCounter.increment()
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            //поджимаем вызов под дедлайн
+            val remainingForCall = maxOf(0, deadline - System.currentTimeMillis())
+            val perCallClient = client.newBuilder()
+                .callTimeout(remainingForCall, TimeUnit.MILLISECONDS)
+                .build()
+
+            perCallClient.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
@@ -88,6 +150,12 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        }
+        finally {
+            ong.release()
+            incomingFinishedRequestsCounter.increment()
+            outgoingFinishedRequestsCounter.increment()
+            // освобождаем слот семафора
         }
     }
 

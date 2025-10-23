@@ -3,10 +3,12 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import org.springframework.http.HttpStatus
 
 @RestController
 class APIController {
@@ -29,7 +31,7 @@ class APIController {
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
-    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
+    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): ResponseEntity<Order> {
         val order = Order(
             UUID.randomUUID(),
             userId,
@@ -37,7 +39,7 @@ class APIController {
             OrderStatus.COLLECTING,
             price,
         )
-        return orderRepository.save(order)
+        return ResponseEntity.ok(orderRepository.save(order))
     }
 
     data class Order(
@@ -55,7 +57,7 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
@@ -63,8 +65,14 @@ class APIController {
         } ?: throw IllegalArgumentException("No such order $orderId")
 
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+        return try {
+            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+            ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        } catch (e: OrderPayer.TooManyRequestsException) {
+            ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", e.retryAfterMillis.toString())
+                .build()
+        }
     }
 
     class PaymentSubmissionDto(
