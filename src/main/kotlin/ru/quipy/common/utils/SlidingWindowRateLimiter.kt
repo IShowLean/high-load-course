@@ -19,8 +19,8 @@ class SlidingWindowRateLimiter(
         return lock.withLock {
             val now = System.currentTimeMillis()
 
-            // Чистим каждые 100мс
-            if (now - lastCleanupTime > 100) {
+            // Чистим прошлые запросы не после каждого нового, а после определённого времени - 100мс
+            if (now - lastCleanupTime > 100 || windowDurationMs > 5000) {
                 val windowStart = now - windowDurationMs
                 requestTimestamps.removeAll { it <= windowStart }
                 lastCleanupTime = now
