@@ -27,8 +27,8 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // Тест 2: 11 rps, 100 - 3 мин. 30+ сек.; Тест 3: 3 rps, 300 - 5 мин.
-    private val intakeRateLimitPerSec = 3
+    // Тест 2: 11 rps, 100 - 3 мин. 30+ сек.; Тест 3: 100 rps, 300 - 5 мин.
+    private val intakeRateLimitPerSec = 100
     private val queueCapacity = 300
     private val paymentQueue = LinkedBlockingQueue<Runnable>(queueCapacity)
 
