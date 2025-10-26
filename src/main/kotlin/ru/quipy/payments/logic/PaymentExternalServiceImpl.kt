@@ -76,22 +76,24 @@ class PaymentExternalSystemAdapterImpl(
 
         // сначала входим в окно (in-flight лимит)
         val remainingBeforeWindow = maxOf(0, deadline - System.currentTimeMillis())
-        // ждать у слайдера будем недолго: не дольше остатка дедлайна и средней обработки
-        val waitForSliderMs = minOf(remainingBeforeWindow, requestAverageProcessingTime.toMillis())
-        ong.acquire()
-
-        //коротко ждём у rate-лимитера, чтобы не держать слот окна слишком долго
-        if (!slidingWindowLimiter.tickBlocking(Duration.ofMillis(waitForSliderMs))) {
-            logger.warn("[$accountName] Payment $paymentId blocked by rate limiter after window")
-            // submission как неотправленную
+        if (!ong.tryAcquire(Duration.ofMillis(remainingBeforeWindow))) {
             paymentESService.update(paymentId) {
                 it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
+
+            logger.warn("[$accountName] Window limited payment $paymentId before outbound call. Queued=${ong.awaitingQueueSize()} fair=${ong.isFair()}")
+            incomingFinishedRequestsCounter.increment()
+            return
+        }
+
+        val timeoutMillis = maxOf(0, deadline - System.currentTimeMillis())
+        if (!slidingWindowLimiter.tickBlocking(Duration.ofMillis(timeoutMillis))) {
             // и один раз фиксируем итог обработки
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "blocked by rate limiter after window")
             }
             ong.release()
+            incomingFinishedRequestsCounter.increment()
             return
         }
 
