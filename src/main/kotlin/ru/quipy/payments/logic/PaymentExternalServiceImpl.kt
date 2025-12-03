@@ -83,7 +83,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val request = Request.Builder()
-            .url("http://$paymentProviderHostPort/external/process?timeout=PT2S&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            .url("http://$paymentProviderHostPort/external/process?timeout=PT60S&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
             .post(emptyBody)
             .build()
 
