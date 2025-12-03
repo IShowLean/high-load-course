@@ -69,9 +69,9 @@ class PaymentExternalSystemAdapterImpl(
             rateLimiter.tickBlocking()
 
             val url = if (timeOut.isZero) {
-                "https://$paymentProviderHostPort/external/process?serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+                "http://$paymentProviderHostPort/external/process?serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
             } else {
-                "https://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+                "http://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
             }
 
             val request = Request.Builder()
