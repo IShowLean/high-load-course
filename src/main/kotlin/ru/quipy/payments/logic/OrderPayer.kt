@@ -15,6 +15,7 @@ import java.util.*
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
 
 @Service
 class OrderPayer(
@@ -70,7 +71,7 @@ class OrderPayer(
         val future = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
 
         future
-            .orTimeout(deadline - System.currentTimeMillis().coerceAtLeast(1), TimeUnit.MILLISECONDS)
+            .orTimeout(max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)
             .whenCompleteAsync({ success, error ->
                 requestLatency.record(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS)
 

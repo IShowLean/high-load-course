@@ -37,24 +37,21 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val timeOut = Duration.ofSeconds(0)
 
-    private val clients: List<OkHttpClient> = List(15) { idx ->
-        val exec = Executors.newFixedThreadPool(max(200, properties.parallelRequests / 20))
-        val dispatcher = Dispatcher(exec).apply {
-            maxRequests = max(200, properties.parallelRequests / 20)
-            maxRequestsPerHost = max(200, properties.parallelRequests / 20)
-        }
+    private val clients: List<OkHttpClient> = List(15) {
         OkHttpClient.Builder()
-            .dispatcher(dispatcher)
-            .connectionPool(ConnectionPool(1, 10, TimeUnit.SECONDS))
-            .readTimeout(30, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
+            .dispatcher(Dispatcher(Executors.newFixedThreadPool(250)).apply {
+                maxRequests = 250
+                maxRequestsPerHost = 250
+            })
+            .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
             .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+            .readTimeout(90, TimeUnit.SECONDS)
             .build()
     }
 
     private val clientIndex = AtomicInteger(0)
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(properties.parallelRequests)
+    private val ongoingWindow = OngoingWindow(properties.parallelRequests)  // блокирующий!
 
     override fun performPaymentAsync(
         paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long
@@ -63,7 +60,6 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         val cf = CompletableFuture<Boolean>()
 
-        // всегда логируем submission как success (требование теста)
         paymentESService.update(paymentId) {
             it.logSubmission(true, transactionId, System.currentTimeMillis(), Duration.ofMillis(System.currentTimeMillis() - paymentStartedAt))
         }
@@ -72,29 +68,26 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             rateLimiter.tickBlocking()
 
-            val urlString = if (timeOut != Duration.ofSeconds(0)) {
-                "https://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            } else {
+            val url = if (timeOut.isZero) {
                 "https://$paymentProviderHostPort/external/process?serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+            } else {
+                "https://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
             }
 
             val request = Request.Builder()
-                .url(urlString)
+                .url(url)
                 .post(emptyBody)
                 .build()
 
-            val client = clients[clientIndex.getAndIncrement() % clients.size]
+            val client = clients[clientIndex.getAndIncrement() % 15]
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, System.currentTimeMillis(), transactionId, e.message ?: "IO Error")
-                        }
-                    } finally {
-                        ongoingWindow.release()
-                        cf.complete(false)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, System.currentTimeMillis(), transactionId, e.message ?: "IO Error")
                     }
+                    ongoingWindow.release()
+                    cf.complete(false)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -119,10 +112,10 @@ class PaymentExternalSystemAdapterImpl(
             })
 
         } catch (e: Exception) {
-            ongoingWindow.release()
             paymentESService.update(paymentId) {
-                it.logProcessing(false, System.currentTimeMillis(), transactionId, "Rejected: ${e.message}")
+                it.logProcessing(false, System.currentTimeMillis(), transactionId, "Rate limit exceeded")
             }
+            ongoingWindow.release()
             cf.complete(false)
         }
 
