@@ -14,7 +14,9 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -37,14 +39,18 @@ class PaymentExternalSystemAdapterImpl(
     private val outgoingRequestsCounter = Counter.builder("outgoing.requests").tags("account", accountName).register(meterRegistry)
     private val outgoingFinishedRequestsCounter = Counter.builder("outgoing.finished.requests").tags("account", accountName).register(meterRegistry)
 
-    private val baseClient = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply {
-            maxRequests = 20000
-            maxRequestsPerHost = 20000
-        })
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+    private val dispatcherExecutor = Executors.newFixedThreadPool(max(200, properties.parallelRequests / 2))
+
+    private val dispatcher = Dispatcher(dispatcherExecutor).apply {
+        maxRequests = Integer.MAX_VALUE
+        maxRequestsPerHost = Integer.MAX_VALUE
+    }
+
+    private val client = OkHttpClient.Builder()
+        .dispatcher(dispatcher)
+        .connectionPool(ConnectionPool(properties.parallelRequests, 20, TimeUnit.SECONDS))
+        .readTimeout(Duration.ofSeconds(30))
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
         .build()
 
     private val slidingWindowLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -87,8 +93,8 @@ class PaymentExternalSystemAdapterImpl(
             .post(emptyBody)
             .build()
 
-        val clientWithTimeout = baseClient.newBuilder()
-            .callTimeout(remaining.coerceAtMost(45_000), TimeUnit.MILLISECONDS)
+        val clientWithTimeout = client.newBuilder()
+            .callTimeout(remaining.coerceAtMost(35_000), TimeUnit.MILLISECONDS)
             .build()
 
         outgoingRequestsCounter.increment()

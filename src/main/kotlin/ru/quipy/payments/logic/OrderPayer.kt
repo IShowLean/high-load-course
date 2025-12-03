@@ -31,7 +31,7 @@ class OrderPayer(
         private const val CORE_POOL_SIZE = (1 * PARALLEL_HTTP).toInt()
         private const val MAX_WAIT_MS = 60000L
         private const val RATE_PER_SEC_LIMIT = 2000
-        private const val QUEUE_CAPACITY = 500000
+        private const val QUEUE_CAPACITY = 5000
     }
 
     @Autowired
