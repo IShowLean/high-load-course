@@ -31,11 +31,11 @@ class OrderPayer(
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = object : ScheduledThreadPoolExecutor(
-        500, // ← вот это даёт 1000 RPS вместо 380
+        250,
         NamedThreadFactory("payment-submission-executor")
     ) {
         init {
-            maximumPoolSize = 500
+            maximumPoolSize = 250
             setKeepAliveTime(0L, TimeUnit.MILLISECONDS)
             setRemoveOnCancelPolicy(true)
         }

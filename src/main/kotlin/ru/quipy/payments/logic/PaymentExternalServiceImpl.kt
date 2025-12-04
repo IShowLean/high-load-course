@@ -23,7 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    meterRegistry: Any // не используем
+    meterRegistry: Any
 ) : PaymentExternalSystemAdapter {
 
     companion object {
