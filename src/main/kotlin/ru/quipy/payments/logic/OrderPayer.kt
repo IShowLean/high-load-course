@@ -29,7 +29,7 @@ class OrderPayer(
 
     private val paymentExecutor = object : ScheduledThreadPoolExecutor(
         400,
-        NamedThreadFactory("payment-submission-executor")
+        NamedThreadFactory("payment-http-executor")
     ) {
         init {
             maximumPoolSize = 400
