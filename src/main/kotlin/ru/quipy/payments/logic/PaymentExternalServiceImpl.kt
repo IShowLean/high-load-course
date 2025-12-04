@@ -16,7 +16,6 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
-import kotlin.math.max
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -30,82 +29,44 @@ class PaymentExternalSystemAdapterImpl(
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
         private val emptyBody = RequestBody.create(null, ByteArray(0))
         private val mapper = ObjectMapper().registerKotlinModule()
-
-        private fun createRateLimiter(ratePerSec: Int): RateLimiter {
-            val config = RateLimiterConfig.custom()
-                .limitRefreshPeriod(Duration.ofSeconds(1))
-                .limitForPeriod(ratePerSec)
-                .timeoutDuration(Duration.ofHours(1))
-                .build()
-            return RateLimiterRegistry.of(config).rateLimiter("rl-${UUID.randomUUID()}")
-        }
     }
 
     private val accountName = properties.accountName
-    private val rateLimiter = createRateLimiter(properties.rateLimitPerSec)
-    private val ongoingWindow = java.util.concurrent.Semaphore(properties.parallelRequests)
 
-    private val clients: List<OkHttpClient> = List(30) {
-        val maxPerClient = max(200, properties.parallelRequests * 3 / 2 / 30 + 20)
-        val dispatcher = Dispatcher().apply {
-            maxRequests = maxPerClient * 2
-            maxRequestsPerHost = maxPerClient * 2
-        }
-
-        OkHttpClient.Builder()
-            .dispatcher(dispatcher)
-            .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
-            .connectTimeout(Duration.ofSeconds(5))
-            .readTimeout(Duration.ofSeconds(70))
-            .writeTimeout(Duration.ofSeconds(5))
-            .retryOnConnectionFailure(true)
-            .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+    private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
+        RateLimiterConfig.custom()
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .limitForPeriod(properties.rateLimitPerSec)
+            .timeoutDuration(Duration.ofHours(1))
             .build()
-    }
+    ).rateLimiter("rl-$accountName")
+
+    private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
+
+    private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = properties.parallelRequests * 2
+            maxRequestsPerHost = properties.parallelRequests * 2
+        })
+        .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
+        .connectTimeout(Duration.ofSeconds(5))
+        .readTimeout(Duration.ofSeconds(70))
+        .writeTimeout(Duration.ofSeconds(5))
+        .retryOnConnectionFailure(true)
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+        .build()
 
     init {
-        // Общее количество TCP-соединений по всем клиентам
-        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.total", this) { obj ->
-            obj.clients.sumOf { it.connectionPool.connectionCount() }.toDouble()
-        }
-            .description("Total active + idle TCP connections to payment provider ($accountName)")
+        io.micrometer.core.instrument.Gauge.builder("tcp.connections.total", client.connectionPool::connectionCount)
+            .description("Total TCP connections ($accountName)")
             .tag("account", accountName)
-            .tag("what", "real-tcp-connections")
-            .strongReference(true)
             .register(meterRegistry)
 
-        // Количество простаивающих (idle) соединений
-        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.idle", this) { obj ->
-            obj.clients.sumOf { it.connectionPool.idleConnectionCount() }.toDouble()
-        }
-            .description("Idle TCP connections waiting in pool ($accountName)")
+        io.micrometer.core.instrument.Gauge.builder("tcp.connections.idle", client.connectionPool::idleConnectionCount)
+            .description("Idle TCP connections ($accountName)")
             .tag("account", accountName)
-            .tag("what", "real-tcp-connections")
-            .strongReference(true)
             .register(meterRegistry)
-
-        // Активные
-        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.active", this) { obj ->
-            (obj.clients.sumOf { it.connectionPool.connectionCount() } - obj.clients.sumOf { it.connectionPool.idleConnectionCount() }).toDouble()
-        }
-            .description("Currently active TCP connections in use ($accountName)")
-            .tag("account", accountName)
-            .tag("what", "real-tcp-connections")
-            .strongReference(true)
-            .register(meterRegistry)
-
-        // Опционально: по каждому клиенту отдельно
-        clients.forEachIndexed { idx, client ->
-            io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.per_client", client.connectionPool::connectionCount)
-                .description("TCP connections per individual OkHttpClient instance")
-                .tag("account", accountName)
-                .tag("what", "real-tcp-connections")
-                .strongReference(true)
-                .register(meterRegistry)
-        }
     }
-
-    private val clientIndex = java.util.concurrent.atomic.AtomicInteger(0)
 
     override fun performPaymentAsync(
         paymentId: UUID,
@@ -113,85 +74,65 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ): CompletableFuture<Boolean> {
-
         val transactionId = UUID.randomUUID()
-        val queueEnterTime = System.currentTimeMillis()
-        val resultFuture = CompletableFuture<Boolean>()
+        val enterTime = System.currentTimeMillis()
+        val result = CompletableFuture<Boolean>()
 
         paymentESService.update(paymentId) {
-            it.logSubmission(
-                success = true,
-                transactionId = transactionId,
-                startedAt = paymentStartedAt,
-                spentInQueueDuration = Duration.ofMillis(queueEnterTime - paymentStartedAt)
-            )
+            it.logSubmission(true, transactionId, paymentStartedAt, Duration.ofMillis(enterTime - paymentStartedAt))
         }
 
         try {
             rateLimiter.acquirePermission()
-            ongoingWindow.acquire()
+            parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
                     "serviceName=${properties.serviceName}&token=$token&accountName=$accountName&" +
                     "transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
-            val request = Request.Builder()
-                .url(url)
-                .post(emptyBody)
-                .build()
-
-            val client = clients[clientIndex.getAndIncrement() and Int.MAX_VALUE % clients.size]
+            val request = Request.Builder().url(url).post(emptyBody).build()
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "network error"
-                    logger.warn("[$accountName] Request failed $paymentId tx=$transactionId: $reason")
-
+                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
+                    logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = reason)
+                        it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
                     }
-
-                    resultFuture.complete(false)
-                    ongoingWindow.release()
+                    result.complete(false)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     try {
                         val bodyText = response.body?.string().orEmpty()
-                        val extResponse = try {
+                        val extResp = try {
                             mapper.readValue(bodyText, ExternalSysResponse::class.java)
                         } catch (ex: Exception) {
-                            logger.error("[$accountName] Parse error $paymentId: $bodyText", ex)
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, ex.message)
                         }
 
                         paymentESService.update(paymentId) {
-                            it.logProcessing(
-                                success = extResponse.result,
-                                processedAt = System.currentTimeMillis(),
-                                transactionId = transactionId,
-                                reason = extResponse.message
-                            )
+                            it.logProcessing(extResp.result, System.currentTimeMillis(), transactionId, extResp.message)
                         }
-
-                        resultFuture.complete(extResponse.result)
+                        result.complete(extResp.result)
                     } catch (t: Throwable) {
-                        logger.error("[$accountName] Exception in onResponse $paymentId", t)
-                        resultFuture.complete(false)
+                        result.complete(false)
                     } finally {
                         response.close()
-                        ongoingWindow.release()
                     }
+                }
+
+                init {
+                    parallelSemaphore.release()
                 }
             })
 
         } catch (ex: Exception) {
-            ongoingWindow.release()
-            logger.error("[$accountName] Failed before sending request $paymentId", ex)
-            resultFuture.complete(false)
+            parallelSemaphore.release()
+            result.complete(false)
         }
 
-        return resultFuture
+        return result
     }
 
     override fun price() = properties.price
