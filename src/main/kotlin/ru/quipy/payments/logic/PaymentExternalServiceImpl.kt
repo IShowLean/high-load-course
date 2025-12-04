@@ -70,7 +70,8 @@ class PaymentExternalSystemAdapterImpl(
         }
             .description("Total active + idle TCP connections to payment provider ($accountName)")
             .tag("account", accountName)
-            .tag("service", properties.serviceName)
+            .tag("what", "real-tcp-connections")
+            .strongReference(true)
             .register(meterRegistry)
 
         // Количество простаивающих (idle) соединений
@@ -79,7 +80,8 @@ class PaymentExternalSystemAdapterImpl(
         }
             .description("Idle TCP connections waiting in pool ($accountName)")
             .tag("account", accountName)
-            .tag("service", properties.serviceName)
+            .tag("what", "real-tcp-connections")
+            .strongReference(true)
             .register(meterRegistry)
 
         // Активные
@@ -88,7 +90,8 @@ class PaymentExternalSystemAdapterImpl(
         }
             .description("Currently active TCP connections in use ($accountName)")
             .tag("account", accountName)
-            .tag("service", properties.serviceName)
+            .tag("what", "real-tcp-connections")
+            .strongReference(true)
             .register(meterRegistry)
 
         // Опционально: по каждому клиенту отдельно
@@ -96,7 +99,8 @@ class PaymentExternalSystemAdapterImpl(
             io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.per_client", client.connectionPool::connectionCount)
                 .description("TCP connections per individual OkHttpClient instance")
                 .tag("account", accountName)
-                .tag("client_index", idx.toString())
+                .tag("what", "real-tcp-connections")
+                .strongReference(true)
                 .register(meterRegistry)
         }
     }
