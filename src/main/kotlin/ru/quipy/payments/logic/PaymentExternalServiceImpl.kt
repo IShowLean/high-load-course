@@ -63,6 +63,44 @@ class PaymentExternalSystemAdapterImpl(
             .build()
     }
 
+    init {
+        // Общее количество TCP-соединений по всем клиентам
+        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.total", this) { obj ->
+            obj.clients.sumOf { it.connectionPool.connectionCount() }.toDouble()
+        }
+            .description("Total active + idle TCP connections to payment provider ($accountName)")
+            .tag("account", accountName)
+            .tag("service", properties.serviceName)
+            .register(meterRegistry)
+
+        // Количество простаивающих (idle) соединений
+        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.idle", this) { obj ->
+            obj.clients.sumOf { it.connectionPool.idleConnectionCount() }.toDouble()
+        }
+            .description("Idle TCP connections waiting in pool ($accountName)")
+            .tag("account", accountName)
+            .tag("service", properties.serviceName)
+            .register(meterRegistry)
+
+        // Активные
+        io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.active", this) { obj ->
+            (obj.clients.sumOf { it.connectionPool.connectionCount() } - obj.clients.sumOf { it.connectionPool.idleConnectionCount() }).toDouble()
+        }
+            .description("Currently active TCP connections in use ($accountName)")
+            .tag("account", accountName)
+            .tag("service", properties.serviceName)
+            .register(meterRegistry)
+
+        // Опционально: по каждому клиенту отдельно
+        clients.forEachIndexed { idx, client ->
+            io.micrometer.core.instrument.Gauge.builder("okhttp.tcp.connections.per_client", client.connectionPool::connectionCount)
+                .description("TCP connections per individual OkHttpClient instance")
+                .tag("account", accountName)
+                .tag("client_index", idx.toString())
+                .register(meterRegistry)
+        }
+    }
+
     private val clientIndex = java.util.concurrent.atomic.AtomicInteger(0)
 
     override fun performPaymentAsync(
