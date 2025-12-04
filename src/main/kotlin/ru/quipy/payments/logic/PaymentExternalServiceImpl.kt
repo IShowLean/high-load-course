@@ -2,8 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.fasterxml.jackson.databind.ObjectMapper
-import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.*
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
@@ -25,7 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    meterRegistry: MeterRegistry
+    meterRegistry: Any // не используем
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -34,15 +32,15 @@ class PaymentExternalSystemAdapterImpl(
         private val emptyBody = ByteArray(0).toRequestBody(null)
     }
 
-    private val accountName = properties.accountName
     private val timeOut = Duration.ofSeconds(0)
 
-    private val clients: List<OkHttpClient> = List(15) {
+    private val clients = List(15) {
+        val dispatcher = Dispatcher(Executors.newFixedThreadPool(250)).apply {
+            maxRequests = 250
+            maxRequestsPerHost = 250
+        }
         OkHttpClient.Builder()
-            .dispatcher(Dispatcher(Executors.newFixedThreadPool(250)).apply {
-                maxRequests = 250
-                maxRequestsPerHost = 250
-            })
+            .dispatcher(dispatcher)
             .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
             .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
             .readTimeout(90, TimeUnit.SECONDS)
@@ -51,7 +49,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val clientIndex = AtomicInteger(0)
     private val rateLimiter = SlidingWindowRateLimiter(properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(properties.parallelRequests)  // блокирующий!
+    private val ongoingWindow = OngoingWindow(properties.parallelRequests)
 
     override fun performPaymentAsync(
         paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long
@@ -68,23 +66,17 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             rateLimiter.tickBlocking()
 
-            val url = if (timeOut.isZero) {
-                "http://$paymentProviderHostPort/external/process?serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            } else {
-                "http://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=${properties.serviceName}&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            }
+            val url = "http://$paymentProviderHostPort/external/process" +
+                    "?serviceName=${properties.serviceName}&token=$token" +
+                    "&accountName=${properties.accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
-            val request = Request.Builder()
-                .url(url)
-                .post(emptyBody)
-                .build()
-
+            val request = Request.Builder().url(url).post(emptyBody).build()
             val client = clients[clientIndex.getAndIncrement() % 15]
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, System.currentTimeMillis(), transactionId, e.message ?: "IO Error")
+                        it.logProcessing(false, System.currentTimeMillis(), transactionId, e.message)
                     }
                     ongoingWindow.release()
                     cf.complete(false)
@@ -92,16 +84,15 @@ class PaymentExternalSystemAdapterImpl(
 
                 override fun onResponse(call: Call, response: Response) {
                     response.use {
-                        val bodyStr = response.body?.string() ?: ""
                         val success = try {
-                            val resp = mapper.readValue(bodyStr, ExternalSysResponse::class.java)
+                            val resp = mapper.readValue(response.body?.string() ?: "", ExternalSysResponse::class.java)
                             paymentESService.update(paymentId) {
                                 it.logProcessing(resp.result, System.currentTimeMillis(), transactionId, resp.message)
                             }
                             resp.result
-                        } catch (ex: Exception) {
+                        } catch (e: Exception) {
                             paymentESService.update(paymentId) {
-                                it.logProcessing(false, System.currentTimeMillis(), transactionId, "Parse error")
+                                it.logProcessing(false, System.currentTimeMillis(), transactionId, "parse error")
                             }
                             false
                         }
@@ -110,10 +101,9 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             })
-
         } catch (e: Exception) {
             paymentESService.update(paymentId) {
-                it.logProcessing(false, System.currentTimeMillis(), transactionId, "Rate limit exceeded")
+                it.logProcessing(false, System.currentTimeMillis(), transactionId, "rejected")
             }
             ongoingWindow.release()
             cf.complete(false)

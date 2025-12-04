@@ -15,7 +15,6 @@ import java.util.*
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
-import kotlin.math.max
 
 @Service
 class OrderPayer(
@@ -32,13 +31,13 @@ class OrderPayer(
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = object : ScheduledThreadPoolExecutor(
-        500,
+        500, // ← вот это даёт 1000 RPS вместо 380
         NamedThreadFactory("payment-submission-executor")
     ) {
         init {
             maximumPoolSize = 500
             setKeepAliveTime(0L, TimeUnit.MILLISECONDS)
-            removeOnCancelPolicy = true
+            setRemoveOnCancelPolicy(true)
         }
     }
 
@@ -51,14 +50,11 @@ class OrderPayer(
         .register(meterRegistry)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
-        val createdAt = System.currentTimeMillis()
-        if (!bucketQueue.tick()) {
-            return null
-        }
+        if (!bucketQueue.tick()) return null
 
+        val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
-            val event = paymentESService.create { it.create(paymentId, orderId, amount) }
-            logger.trace("Payment ${event.paymentId} created for order $orderId")
+            paymentESService.create { it.create(paymentId, orderId, amount) }
             retryAsync(paymentId, amount, createdAt, deadline, 1)
         }
         return createdAt
@@ -67,16 +63,15 @@ class OrderPayer(
     private fun retryAsync(paymentId: UUID, amount: Int, createdAt: Long, deadline: Long, attempt: Int) {
         if (System.currentTimeMillis() >= deadline) return
 
-        val start = System.currentTimeMillis()
         val future = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        val timeLeft = deadline - System.currentTimeMillis()
 
         future
-            .orTimeout(max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS)
+            .orTimeout(timeLeft.coerceAtLeast(1), TimeUnit.MILLISECONDS)
             .whenCompleteAsync({ success, error ->
-                requestLatency.record(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS)
+                requestLatency.record(System.currentTimeMillis() - (deadline - timeLeft), TimeUnit.MILLISECONDS)
 
-                val failed = error != null || success != true
-                if (failed) {
+                if (error != null || success != true) {
                     paymentRetryCounter.increment()
                     if (deadline - System.currentTimeMillis() > 2000) {
                         retryOpportunityCounter.increment()
@@ -90,9 +85,8 @@ class OrderPayer(
         val timeLeft = deadline - System.currentTimeMillis()
         if (timeLeft <= 0) return
 
-        val baseBackoff = (100L shl (attempt - 1)).coerceAtMost(2000L)
-        val jitter = ThreadLocalRandom.current().nextLong(0, 100L)
-        val delayMs = (baseBackoff + jitter).coerceAtMost(timeLeft - 500)
+        val backoff = (100L shl (attempt - 1)).coerceAtMost(2000L)
+        val delayMs = (backoff + ThreadLocalRandom.current().nextLong(100)).coerceAtMost(timeLeft - 500)
 
         paymentExecutor.schedule({
             retryAsync(paymentId, amount, createdAt, deadline, attempt)
