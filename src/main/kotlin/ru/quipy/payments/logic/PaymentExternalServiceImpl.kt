@@ -2,30 +2,20 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.micrometer.core.instrument.Counter
+import io.github.resilience4j.ratelimiter.RateLimiter
+import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry
 import io.micrometer.core.instrument.MeterRegistry
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.ConnectionPool
-import okhttp3.Dispatcher
-import okhttp3.Protocol
-import okhttp3.Response
-import java.io.IOException
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 class PaymentExternalSystemAdapterImpl(
@@ -33,189 +23,136 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val meterRegistry: MeterRegistry
+    meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
-        val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
+        private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
+        private val emptyBody = RequestBody.create(null, ByteArray(0))
+        private val mapper = ObjectMapper().registerKotlinModule()
 
-        val emptyBody = RequestBody.create(null, ByteArray(0))
-        val mapper = ObjectMapper().registerKotlinModule()
+        private fun createRateLimiter(ratePerSec: Int): RateLimiter {
+            val config = RateLimiterConfig.custom()
+                .limitRefreshPeriod(Duration.ofSeconds(1))
+                .limitForPeriod(ratePerSec)
+                .timeoutDuration(Duration.ofHours(1))
+                .build()
+            return RateLimiterRegistry.of(config).rateLimiter("rl-${UUID.randomUUID()}")
+        }
     }
 
-    private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val timeOut = Duration.ofSeconds(0)
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
+    private val rateLimiter = createRateLimiter(properties.rateLimitPerSec)
+    private val ongoingWindow = java.util.concurrent.Semaphore(properties.parallelRequests)
 
-    private val clients: List<OkHttpClient> = List(15) { idx ->
-        val exec = Executors.newFixedThreadPool(max(200, parallelRequests / 2))
-        val dispatcher = Dispatcher(exec).apply {
-            maxRequests = max(200, parallelRequests / 2)
-            maxRequestsPerHost = max(200, parallelRequests / 2)
+    private val clients: List<OkHttpClient> = List(30) {
+        val maxPerClient = max(200, properties.parallelRequests * 3 / 2 / 30 + 20)
+        val dispatcher = Dispatcher().apply {
+            maxRequests = maxPerClient * 2
+            maxRequestsPerHost = maxPerClient * 2
         }
 
         OkHttpClient.Builder()
             .dispatcher(dispatcher)
-            .connectionPool(ConnectionPool(1, 10, TimeUnit.SECONDS))
-            .readTimeout(Duration.ofSeconds(30))
+            .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
+            .connectTimeout(Duration.ofSeconds(5))
+            .readTimeout(Duration.ofSeconds(70))
+            .writeTimeout(Duration.ofSeconds(5))
             .retryOnConnectionFailure(true)
             .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
             .build()
     }
 
-    private val clientIndex = AtomicInteger(0)
+    private val clientIndex = java.util.concurrent.atomic.AtomicInteger(0)
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(
-        rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1)
-    )
-
-    private val ongoingWindow = OngoingWindow(parallelRequests)
-
-
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Boolean> {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+    override fun performPaymentAsync(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long
+    ): CompletableFuture<Boolean> {
 
         val transactionId = UUID.randomUUID()
+        val queueEnterTime = System.currentTimeMillis()
+        val resultFuture = CompletableFuture<Boolean>()
 
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            it.logSubmission(
+                success = true,
+                transactionId = transactionId,
+                startedAt = paymentStartedAt,
+                spentInQueueDuration = Duration.ofMillis(queueEnterTime - paymentStartedAt)
+            )
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-
-        val cf = CompletableFuture<Boolean>()
-
         try {
+            rateLimiter.acquirePermission()
             ongoingWindow.acquire()
-            slidingWindowRateLimiter.tickBlocking()
 
-            var urlString = if (timeOut != Duration.ofSeconds(0)) {
-                "http://$paymentProviderHostPort/external/process?timeout=$timeOut&serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            } else {
-                "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            }
+            val url = "http://$paymentProviderHostPort/external/process?" +
+                    "serviceName=${properties.serviceName}&token=$token&accountName=$accountName&" +
+                    "transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
-            val request = Request.Builder().run {
-                url(urlString)
-                post(emptyBody)
-            }.build()
+            val request = Request.Builder()
+                .url(url)
+                .post(emptyBody)
+                .build()
 
-            val idx = clientIndex.getAndIncrement()
-            val client = clients[(idx and Int.MAX_VALUE) % clients.size]
+            val client = clients[clientIndex.getAndIncrement() and Int.MAX_VALUE % clients.size]
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        if (e is SocketTimeoutException) {
-                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                                }
-                            } catch (u: Exception) {
-                                logger.error("[$accountName] Error while updating ES on timeout for payment $paymentId, txId: $transactionId", u)
-                            }
-                        } else {
-                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                                }
-                            } catch (u: Exception) {
-                                logger.error("[$accountName] Error while updating ES on failure for payment $paymentId, txId: $transactionId", u)
-                            }
-                        }
-                    } finally {
-                        try { ongoingWindow.release() } catch (u: Exception) { logger.error("[$accountName] Error releasing ongoingWindow", u) }
-                        cf.complete(false)
+                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "network error"
+                    logger.warn("[$accountName] Request failed $paymentId tx=$transactionId: $reason")
+
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = reason)
                     }
+
+                    resultFuture.complete(false)
+                    ongoingWindow.release()
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     try {
-                        val bodyText = try {
-                            response.body?.string()
-                        } catch (e: Exception) {
-                            null
-                        }
-
-                        val body = try {
+                        val bodyText = response.body?.string().orEmpty()
+                        val extResponse = try {
                             mapper.readValue(bodyText, ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
-                                        "payment: $paymentId, result code: ${response.code}, reason: ${bodyText}",
-                                e
+                        } catch (ex: Exception) {
+                            logger.error("[$accountName] Parse error $paymentId: $bodyText", ex)
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, ex.message)
+                        }
+
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(
+                                success = extResponse.result,
+                                processedAt = System.currentTimeMillis(),
+                                transactionId = transactionId,
+                                reason = extResponse.message
                             )
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message ?: bodyText)
                         }
 
-                        logger.warn(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                    "succeeded: ${body.result}, message: ${body.message}"
-                        )
-
-                        val result = body.result
-
-                        try {
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                            }
-                        } catch (u: Exception) {
-                            logger.error("[$accountName] Error while updating ES on response for payment $paymentId, txId: $transactionId", u)
-                        }
-
-                        cf.complete(result)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e)
-                        try {
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, now(), transactionId, reason = e.message)
-                            }
-                        } catch (u: Exception) {
-                            logger.error("[$accountName] Error while updating ES in exception handler for payment $paymentId, txId: $transactionId", u)
-                        } finally {
-                            cf.complete(false)
-                        }
+                        resultFuture.complete(extResponse.result)
+                    } catch (t: Throwable) {
+                        logger.error("[$accountName] Exception in onResponse $paymentId", t)
+                        resultFuture.complete(false)
                     } finally {
-                        try { ongoingWindow.release() } catch (u: Exception) { logger.error("[$accountName] Error releasing ongoingWindow", u) }
+                        response.close()
+                        ongoingWindow.release()
                     }
                 }
             })
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
+        } catch (ex: Exception) {
             ongoingWindow.release()
+            logger.error("[$accountName] Failed before sending request $paymentId", ex)
+            resultFuture.complete(false)
         }
 
-        return cf
+        return resultFuture
     }
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
     override fun name() = properties.accountName
-
 }
-
-public fun now() = System.currentTimeMillis()
