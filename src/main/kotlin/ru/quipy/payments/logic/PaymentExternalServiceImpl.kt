@@ -8,6 +8,8 @@ import io.github.resilience4j.ratelimiter.RateLimiterRegistry
 import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.*
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
@@ -15,6 +17,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -32,6 +35,32 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val accountName = properties.accountName
+
+    private val dbExecutor = object : ScheduledThreadPoolExecutor(
+        200,
+        NamedThreadFactory("payment-db-executor")
+    ) {
+        init {
+            maximumPoolSize = 200
+            removeOnCancelPolicy = true
+            rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
+        }
+    }.apply {
+        io.micrometer.core.instrument.Gauge.builder("db.threadpool.active", this) { it.activeCount.toDouble() }
+            .description("Active threads in DB pool ($accountName)")
+            .tag("account", accountName)
+            .register(meterRegistry)
+
+        io.micrometer.core.instrument.Gauge.builder("db.threadpool.size", this) { it.poolSize.toDouble() }
+            .description("Current pool size ($accountName)")
+            .tag("account", accountName)
+            .register(meterRegistry)
+
+        io.micrometer.core.instrument.Gauge.builder("db.threadpool.queue", this) { it.queue.size.toDouble() }
+            .description("Tasks in queue ($accountName)")
+            .tag("account", accountName)
+            .register(meterRegistry)
+    }
 
     private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
         RateLimiterConfig.custom()
@@ -78,9 +107,11 @@ class PaymentExternalSystemAdapterImpl(
         val enterTime = System.currentTimeMillis()
         val result = CompletableFuture<Boolean>()
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(true, transactionId, paymentStartedAt, Duration.ofMillis(enterTime - paymentStartedAt))
-        }
+        CompletableFuture.runAsync({
+            paymentESService.update(paymentId) {
+                it.logSubmission(true, transactionId, paymentStartedAt, Duration.ofMillis(enterTime - paymentStartedAt))
+            }
+        }, dbExecutor)
 
         try {
             rateLimiter.acquirePermission()
@@ -96,9 +127,13 @@ class PaymentExternalSystemAdapterImpl(
                 override fun onFailure(call: Call, e: IOException) {
                     val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
                     logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
-                    }
+
+                    CompletableFuture.runAsync({
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
+                        }
+                    }, dbExecutor)
+
                     result.complete(false)
                 }
 
@@ -111,9 +146,12 @@ class PaymentExternalSystemAdapterImpl(
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, ex.message)
                         }
 
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(extResp.result, System.currentTimeMillis(), transactionId, extResp.message)
-                        }
+                        CompletableFuture.runAsync({
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(extResp.result, System.currentTimeMillis(), transactionId, extResp.message)
+                            }
+                        }, dbExecutor)
+
                         result.complete(extResp.result)
                     } catch (t: Throwable) {
                         result.complete(false)
