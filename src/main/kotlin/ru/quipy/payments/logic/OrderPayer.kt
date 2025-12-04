@@ -20,6 +20,7 @@ class OrderPayer(
         private val logger = LoggerFactory.getLogger(OrderPayer::class.java)
     }
 
+
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
