@@ -18,7 +18,6 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -38,13 +37,13 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
 
     private val dbExecutor = object : ScheduledThreadPoolExecutor(
-        800,
+        500,
         NamedThreadFactory("payment-db-executor")
     ) {
         init {
-            maximumPoolSize = 800
+            maximumPoolSize = 500
             removeOnCancelPolicy = true
-            rejectedExecutionHandler = AbortPolicy()
+            rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
         }
     }.apply {
         io.micrometer.core.instrument.Gauge.builder("db.threadpool.active", this) { it.activeCount.toDouble() }
