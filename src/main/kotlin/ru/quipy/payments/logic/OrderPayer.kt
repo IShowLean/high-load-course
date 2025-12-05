@@ -28,11 +28,11 @@ class OrderPayer(
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = object : ScheduledThreadPoolExecutor(
-        1000,
+        400,
         NamedThreadFactory("payment-http-executor")
     ) {
         init {
-            maximumPoolSize = 1000
+            maximumPoolSize = 400
             removeOnCancelPolicy = true
             rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
         }
