@@ -69,7 +69,10 @@ class PaymentExternalSystemAdapterImpl(
             .limitForPeriod(properties.rateLimitPerSec)
             .timeoutDuration(Duration.ofHours(1))
             .build()
-    ).rateLimiter("rl-$accountName")
+    ).rateLimiter("rl-$accountName").apply {
+        changeLimitForPeriod(properties.rateLimitPerSec)
+    }
+
 
     private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
 
@@ -116,7 +119,6 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             rateLimiter.acquirePermission()
-
             parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
@@ -127,8 +129,6 @@ class PaymentExternalSystemAdapterImpl(
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    parallelSemaphore.release()
-
                     val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
                     logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
 
@@ -142,8 +142,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
-                    parallelSemaphore.release()
-
                     try {
                         val bodyText = response.body?.string().orEmpty()
                         val extResp = try {
@@ -165,17 +163,14 @@ class PaymentExternalSystemAdapterImpl(
                         response.close()
                     }
                 }
+
+                init {
+                    parallelSemaphore.release()
+                }
             })
 
         } catch (ex: Exception) {
             parallelSemaphore.release()
-
-            CompletableFuture.runAsync({
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, System.currentTimeMillis(), transactionId, ex.message ?: "error")
-                }
-            }, dbExecutor)
-
             result.complete(false)
         }
 
