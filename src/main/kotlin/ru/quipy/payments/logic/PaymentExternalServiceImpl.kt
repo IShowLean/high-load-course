@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.*
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -18,6 +19,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -42,22 +44,14 @@ class PaymentExternalSystemAdapterImpl(
         NamedThreadFactory("payment-db-executor")
     ) as ThreadPoolExecutor
 
-    private val rateLimiter: RateLimiter = run {
-        val rate = properties.rateLimitPerSec.toLong().coerceAtLeast(1L)
-        val tokensPerPeriod = 50L.coerceAtMost(rate / 10)
-        var periodMs = 1000L * tokensPerPeriod / rate
-        periodMs = periodMs.coerceIn(5L, 200L)
-
-        val limitForPeriod = (rate * periodMs / 1000L).coerceAtLeast(1L).toInt()
-
-        val config = RateLimiterConfig.custom()
-            .limitRefreshPeriod(Duration.ofMillis(periodMs))
-            .limitForPeriod(limitForPeriod)
-            .timeoutDuration(Duration.ofMinutes(30))
+    private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
+        RateLimiterConfig.custom()
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .limitForPeriod(properties.rateLimitPerSec)
+            .timeoutDuration(Duration.ofHours(1))
             .build()
+    ).rateLimiter("rl-$accountName")
 
-        RateLimiterRegistry.of(config).rateLimiter("rl-$accountName")
-    }
 
     private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
 
@@ -104,7 +98,6 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             rateLimiter.acquirePermission()
-
             parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
@@ -115,20 +108,16 @@ class PaymentExternalSystemAdapterImpl(
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
-                        logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
+                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
+                    logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
 
-                        CompletableFuture.runAsync({
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
-                            }
-                        }, dbExecutor)
+                    CompletableFuture.runAsync({
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
+                        }
+                    }, dbExecutor)
 
-                        result.complete(false)
-                    } finally {
-                        parallelSemaphore.release()
-                    }
+                    result.complete(false)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -151,8 +140,11 @@ class PaymentExternalSystemAdapterImpl(
                         result.complete(false)
                     } finally {
                         response.close()
-                        parallelSemaphore.release()
                     }
+                }
+
+                init {
+                    parallelSemaphore.release()
                 }
             })
 
