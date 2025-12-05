@@ -18,6 +18,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -43,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
         init {
             maximumPoolSize = 800
             removeOnCancelPolicy = true
-            rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
+            rejectedExecutionHandler = AbortPolicy()
         }
     }.apply {
         io.micrometer.core.instrument.Gauge.builder("db.threadpool.active", this) { it.activeCount.toDouble() }
