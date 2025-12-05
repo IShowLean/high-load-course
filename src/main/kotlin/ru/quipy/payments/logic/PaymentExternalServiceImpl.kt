@@ -18,7 +18,9 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -37,31 +39,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val accountName = properties.accountName
 
-    private val dbExecutor = object : ScheduledThreadPoolExecutor(
+    private val dbExecutor = Executors.newFixedThreadPool(
         1000,
         NamedThreadFactory("payment-db-executor")
-    ) {
-        init {
-            maximumPoolSize = 1000
-            removeOnCancelPolicy = true
-            rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
-        }
-    }.apply {
-        io.micrometer.core.instrument.Gauge.builder("db.threadpool.active", this) { it.activeCount.toDouble() }
-            .description("Active threads in DB pool ($accountName)")
-            .tag("account", accountName)
-            .register(meterRegistry)
-
-        io.micrometer.core.instrument.Gauge.builder("db.threadpool.size", this) { it.poolSize.toDouble() }
-            .description("Current pool size ($accountName)")
-            .tag("account", accountName)
-            .register(meterRegistry)
-
-        io.micrometer.core.instrument.Gauge.builder("db.threadpool.queue", this) { it.queue.size.toDouble() }
-            .description("Tasks in queue ($accountName)")
-            .tag("account", accountName)
-            .register(meterRegistry)
-    }
+    ) as ThreadPoolExecutor
 
     private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
         RateLimiterConfig.custom()
