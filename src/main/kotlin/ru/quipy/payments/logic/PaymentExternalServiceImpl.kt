@@ -7,6 +7,7 @@ import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry
 import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.*
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
@@ -30,7 +31,7 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
-        private val emptyBody = RequestBody.create(null, ByteArray(0))
+        private val emptyBody = ByteArray(0).toRequestBody(null)
         private val mapper = ObjectMapper().registerKotlinModule()
     }
 
