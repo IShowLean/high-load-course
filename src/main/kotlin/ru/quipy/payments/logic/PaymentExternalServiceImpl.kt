@@ -37,11 +37,11 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
 
     private val dbExecutor = object : ScheduledThreadPoolExecutor(
-        500,
+        1000,
         NamedThreadFactory("payment-db-executor")
     ) {
         init {
-            maximumPoolSize = 500
+            maximumPoolSize = 1000
             removeOnCancelPolicy = true
             rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
         }
