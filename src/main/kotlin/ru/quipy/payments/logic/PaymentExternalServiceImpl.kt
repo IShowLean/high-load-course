@@ -22,6 +22,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -44,13 +46,20 @@ class PaymentExternalSystemAdapterImpl(
         NamedThreadFactory("payment-db-executor")
     ) as ThreadPoolExecutor
 
-    private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
-        RateLimiterConfig.custom()
-            .limitRefreshPeriod(Duration.ofSeconds(1))
-            .limitForPeriod(properties.rateLimitPerSec)
-            .timeoutDuration(Duration.ofHours(1))
-            .build()
-    ).rateLimiter("rl-$accountName")
+    private val ratePerSecond = properties.rateLimitPerSec.toLong().coerceAtLeast(1L)
+    private val intervalNanos = 1_000_000_000L / ratePerSecond
+    private val nextAllowedTimeNanos = AtomicLong(System.nanoTime())
+
+    private fun rateLimitAcquire() {
+        val targetTime = nextAllowedTimeNanos.addAndGet(intervalNanos)
+
+        var delay: Long
+        while (true) {
+            delay = targetTime - System.nanoTime()
+            if (delay <= 0L) break
+            LockSupport.parkNanos(delay)
+        }
+    }
 
 
     private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
@@ -97,7 +106,7 @@ class PaymentExternalSystemAdapterImpl(
         }, dbExecutor)
 
         try {
-            rateLimiter.acquirePermission()
+            rateLimitAcquire()
             parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
