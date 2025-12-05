@@ -106,7 +106,9 @@ class PaymentExternalSystemAdapterImpl(
         }, dbExecutor)
 
         try {
+            // ← вот здесь идеальная ровность с первой миллисекунды
             rateLimitAcquire()
+
             parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
@@ -117,16 +119,20 @@ class PaymentExternalSystemAdapterImpl(
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
-                    logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
+                    try {
+                        val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
+                        logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
 
-                    CompletableFuture.runAsync({
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
-                        }
-                    }, dbExecutor)
+                        CompletableFuture.runAsync({
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
+                            }
+                        }, dbExecutor)
 
-                    result.complete(false)
+                        result.complete(false)
+                    } finally {
+                        parallelSemaphore.release()
+                    }
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -149,11 +155,8 @@ class PaymentExternalSystemAdapterImpl(
                         result.complete(false)
                     } finally {
                         response.close()
+                        parallelSemaphore.release()
                     }
-                }
-
-                init {
-                    parallelSemaphore.release()
                 }
             })
 
