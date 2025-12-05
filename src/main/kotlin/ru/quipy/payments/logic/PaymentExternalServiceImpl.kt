@@ -22,8 +22,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.LockSupport
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -46,20 +44,13 @@ class PaymentExternalSystemAdapterImpl(
         NamedThreadFactory("payment-db-executor")
     ) as ThreadPoolExecutor
 
-    private val ratePerSecond = properties.rateLimitPerSec.toLong().coerceAtLeast(1L)
-    private val intervalNanos = 1_000_000_000L / ratePerSecond
-    private val nextAllowedTimeNanos = AtomicLong(System.nanoTime())
-
-    private fun rateLimitAcquire() {
-        val targetTime = nextAllowedTimeNanos.addAndGet(intervalNanos)
-
-        var delay: Long
-        while (true) {
-            delay = targetTime - System.nanoTime()
-            if (delay <= 0L) break
-            LockSupport.parkNanos(delay)
-        }
-    }
+    private val rateLimiter: RateLimiter = RateLimiterRegistry.of(
+        RateLimiterConfig.custom()
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .limitForPeriod(properties.rateLimitPerSec)
+            .timeoutDuration(Duration.ofHours(1))
+            .build()
+    ).rateLimiter("rl-$accountName")
 
 
     private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
@@ -106,9 +97,7 @@ class PaymentExternalSystemAdapterImpl(
         }, dbExecutor)
 
         try {
-            // ← вот здесь идеальная ровность с первой миллисекунды
-            rateLimitAcquire()
-
+            rateLimiter.acquirePermission()
             parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
@@ -119,20 +108,16 @@ class PaymentExternalSystemAdapterImpl(
 
             client.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
-                        logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
+                    val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
+                    logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
 
-                        CompletableFuture.runAsync({
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
-                            }
-                        }, dbExecutor)
+                    CompletableFuture.runAsync({
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
+                        }
+                    }, dbExecutor)
 
-                        result.complete(false)
-                    } finally {
-                        parallelSemaphore.release()
-                    }
+                    result.complete(false)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -155,8 +140,11 @@ class PaymentExternalSystemAdapterImpl(
                         result.complete(false)
                     } finally {
                         response.close()
-                        parallelSemaphore.release()
                     }
+                }
+
+                init {
+                    parallelSemaphore.release()
                 }
             })
 
