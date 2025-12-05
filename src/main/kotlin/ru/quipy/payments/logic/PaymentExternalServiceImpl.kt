@@ -69,17 +69,15 @@ class PaymentExternalSystemAdapterImpl(
             .limitForPeriod(properties.rateLimitPerSec)
             .timeoutDuration(Duration.ofHours(1))
             .build()
-    ).rateLimiter("rl-$accountName").apply {
-        changeLimitForPeriod(properties.rateLimitPerSec)
-    }
+    ).rateLimiter("rl-$accountName")
 
 
     private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = properties.parallelRequests * 2
-            maxRequestsPerHost = properties.parallelRequests * 2
+            maxRequests = properties.parallelRequests
+            maxRequestsPerHost = properties.parallelRequests
         })
         .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
         .connectTimeout(Duration.ofSeconds(5))
