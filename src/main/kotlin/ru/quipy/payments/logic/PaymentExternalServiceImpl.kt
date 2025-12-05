@@ -67,7 +67,7 @@ class PaymentExternalSystemAdapterImpl(
         RateLimiterConfig.custom()
             .limitRefreshPeriod(Duration.ofSeconds(1))
             .limitForPeriod(properties.rateLimitPerSec)
-            .timeoutDuration(Duration.ofSeconds(0))
+            .timeoutDuration(Duration.ofHours(1))
             .build()
     ).rateLimiter("rl-$accountName")
 
@@ -115,8 +115,8 @@ class PaymentExternalSystemAdapterImpl(
         }, dbExecutor)
 
         try {
-            parallelSemaphore.acquire()
             rateLimiter.acquirePermission()
+            parallelSemaphore.acquire()
 
             val url = "http://$paymentProviderHostPort/external/process?" +
                     "serviceName=${properties.serviceName}&token=$token&accountName=$accountName&" +
