@@ -76,8 +76,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = properties.parallelRequests
-            maxRequestsPerHost = properties.parallelRequests
+            maxRequests = properties.parallelRequests * 2
+            maxRequestsPerHost = properties.parallelRequests * 2
         })
         .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
         .connectTimeout(Duration.ofSeconds(5))
