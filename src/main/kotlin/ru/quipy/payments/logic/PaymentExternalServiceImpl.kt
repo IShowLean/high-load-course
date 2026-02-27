@@ -8,10 +8,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
+import ru.quipy.domain.Event
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
 import java.net.SocketTimeoutException
-import java.util.*
+import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledThreadPoolExecutor
@@ -19,6 +21,8 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
+import kotlin.math.min
+import kotlin.random.Random
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -36,10 +40,47 @@ class PaymentExternalSystemAdapterImpl(
 
     private val accountName = properties.accountName
 
+    private val locks = java.util.concurrent.ConcurrentHashMap<UUID, java.util.concurrent.locks.ReentrantLock>()
+
+    private fun <T> withPaymentLock(paymentId: UUID, block: () -> T): T {
+        val lock = locks.computeIfAbsent(paymentId) { java.util.concurrent.locks.ReentrantLock() }
+        lock.lock()
+        return try {
+            block()
+        } finally {
+            lock.unlock()
+            if (!lock.hasQueuedThreads()) {
+                locks.remove(paymentId, lock)
+            }
+        }
+    }
+
+    private fun updateWithRetry(paymentId: UUID, attempts: Int = 5, block: (PaymentAggregateState) -> Any) {
+        var last: Exception? = null
+        for (i in 1..attempts) {
+            try {
+                paymentESService.update(paymentId) { state -> block(state) as Event<PaymentAggregate> }
+                return
+            } catch (e: Exception) {
+                last = e
+                val backoffMs = (5L * i) + Random.nextLong(0, 15)
+                try {
+                    Thread.sleep(backoffMs)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+        }
+        throw last ?: IllegalStateException("updateWithRetry failed without exception")
+    }
+
     private val dbExecutor = Executors.newFixedThreadPool(
-        1000,
+        min(16, max(4, Runtime.getRuntime().availableProcessors() * 2)),
         NamedThreadFactory("payment-db-executor")
     ) as ThreadPoolExecutor
+
+    private val maxParallel = min(properties.parallelRequests, 200)
 
     private val ratePerSecond = properties.rateLimitPerSec.toLong().coerceAtLeast(1L)
     private val intervalNanos = 1_000_000_000L / ratePerSecond
@@ -49,17 +90,17 @@ class PaymentExternalSystemAdapterImpl(
         2, NamedThreadFactory("payment-rl-$accountName")
     ) as ScheduledThreadPoolExecutor
 
-    private val parallelSemaphore = java.util.concurrent.Semaphore(properties.parallelRequests)
+    private val parallelSemaphore = java.util.concurrent.Semaphore(maxParallel)
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher().apply {
-            maxRequests = properties.parallelRequests * 2
-            maxRequestsPerHost = properties.parallelRequests * 2
+            maxRequests = maxParallel
+            maxRequestsPerHost = maxParallel
         })
         .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES))
-        .connectTimeout(java.time.Duration.ofSeconds(5))
-        .readTimeout(java.time.Duration.ofSeconds(70))
-        .writeTimeout(java.time.Duration.ofSeconds(5))
+        .connectTimeout(Duration.ofSeconds(5))
+        .readTimeout(Duration.ofSeconds(20))
+        .writeTimeout(Duration.ofSeconds(5))
         .retryOnConnectionFailure(true)
         .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
         .build()
@@ -87,14 +128,23 @@ class PaymentExternalSystemAdapterImpl(
         val result = CompletableFuture<Boolean>()
 
         CompletableFuture.runAsync({
-            paymentESService.update(paymentId) {
-                it.logSubmission(true, transactionId, paymentStartedAt, java.time.Duration.ofMillis(enterTime - paymentStartedAt))
+            withPaymentLock(paymentId) {
+                updateWithRetry(paymentId) { state ->
+                    state.logSubmission(
+                        success = true,
+                        transactionId = transactionId,
+                        startedAt = paymentStartedAt,
+                        spentInQueueDuration = Duration.ofMillis(enterTime - paymentStartedAt)
+                    )
+                }
             }
         }, dbExecutor)
 
         val proceed = {
+            var acquired = false
             try {
                 parallelSemaphore.acquire()
+                acquired = true
 
                 val url = "http://$paymentProviderHostPort/external/process?" +
                         "serviceName=${properties.serviceName}&token=$token&accountName=$accountName&" +
@@ -104,20 +154,25 @@ class PaymentExternalSystemAdapterImpl(
 
                 client.newCall(request).enqueue(object : Callback {
                     override fun onFailure(call: Call, e: IOException) {
-                        try {
-                            val reason = if (e is SocketTimeoutException) "timeout" else e.message ?: "io_error"
-                            logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
+                        val reason = if (e is SocketTimeoutException) "timeout" else (e.message ?: "io_error")
+                        val now = System.currentTimeMillis()
+                        logger.warn("[$accountName] FAILED $paymentId tx=$transactionId: $reason")
 
-                            CompletableFuture.runAsync({
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, System.currentTimeMillis(), transactionId, reason)
+                        CompletableFuture.runAsync({
+                            withPaymentLock(paymentId) {
+                                updateWithRetry(paymentId) { state ->
+                                    state.logProcessing(
+                                        success = false,
+                                        processedAt = now,
+                                        transactionId = transactionId,
+                                        reason = reason
+                                    )
                                 }
-                            }, dbExecutor)
+                            }
+                        }, dbExecutor)
 
-                            result.complete(false)
-                        } finally {
-                            parallelSemaphore.release()
-                        }
+                        result.complete(false)
+                        if (acquired) parallelSemaphore.release()
                     }
 
                     override fun onResponse(call: Call, response: Response) {
@@ -129,24 +184,32 @@ class PaymentExternalSystemAdapterImpl(
                                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, ex.message)
                             }
 
+                            val now = System.currentTimeMillis()
+
                             CompletableFuture.runAsync({
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(extResp.result, System.currentTimeMillis(), transactionId, extResp.message)
+                                withPaymentLock(paymentId) {
+                                    updateWithRetry(paymentId) { state ->
+                                        state.logProcessing(
+                                            success = extResp.result,
+                                            processedAt = now,
+                                            transactionId = transactionId,
+                                            reason = extResp.message
+                                        )
+                                    }
                                 }
                             }, dbExecutor)
 
                             result.complete(extResp.result)
-                        } catch (t: Throwable) {
+                        } catch (_: Throwable) {
                             result.complete(false)
                         } finally {
                             response.close()
-                            parallelSemaphore.release()
+                            if (acquired) parallelSemaphore.release()
                         }
                     }
                 })
-
-            } catch (ex: Exception) {
-                parallelSemaphore.release()
+            } catch (_: Exception) {
+                if (acquired) parallelSemaphore.release()
                 result.complete(false)
             }
         }

@@ -27,28 +27,43 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val paymentExecutor = object : ScheduledThreadPoolExecutor(
-        400,
-        NamedThreadFactory("payment-http-executor")
-    ) {
-        init {
-            maximumPoolSize = 400
-            removeOnCancelPolicy = true
-            rejectedExecutionHandler = CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
-        }
-    }
+    private val inFlight = java.util.concurrent.Semaphore(200)
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    private val paymentExecutor = java.util.concurrent.ThreadPoolExecutor(
+        64,
+        64,
+        0L,
+        java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>(5_000),
+        NamedThreadFactory("payment-http-executor"),
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    ).apply { prestartAllCoreThreads() }
+
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
 
-        paymentExecutor.execute {
-            val createdEvent = paymentESService.create { it.create(paymentId, orderId, amount) }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        // если перегруз - сразу отказываем, чтобы API вернул 429
+        if (!inFlight.tryAcquire(200, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            return null
         }
 
-        return createdAt
+        return try {
+            paymentExecutor.execute {
+                try {
+                    val createdEvent = paymentESService.create { it.create(paymentId, orderId, amount) }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                } catch (t: Throwable) {
+                    logger.warn("Payment task failed paymentId=$paymentId orderId=$orderId: ${t.message}", t)
+                } finally {
+                    inFlight.release()
+                }
+            }
+            createdAt
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            inFlight.release()
+            null
+        }
     }
 
     @jakarta.annotation.PreDestroy
