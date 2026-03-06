@@ -4,13 +4,10 @@ import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
-import java.util.*
-import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.UUID
 
 @Service
 class OrderPayer(
@@ -19,7 +16,6 @@ class OrderPayer(
     companion object {
         private val logger = LoggerFactory.getLogger(OrderPayer::class.java)
     }
-
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -42,8 +38,7 @@ class OrderPayer(
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
 
-        // если перегруз - сразу отказываем, чтобы API вернул 429
-        if (!inFlight.tryAcquire(200, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+        if (!inFlight.tryAcquire()) {
             return null
         }
 
