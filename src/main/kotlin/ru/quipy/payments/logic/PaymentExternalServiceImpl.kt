@@ -29,6 +29,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -43,14 +46,57 @@ class PaymentExternalSystemAdapterImpl(
         private val mapper = ObjectMapper().registerKotlinModule()
 
         private const val HEDGE1_DELAY_MS: Long = 180
-        private const val HEDGE2_DELAY_MS: Long = 360
+        private const val HEDGE2_DELAY_MS: Long = 350
 
-        private val REQUEST_TIMEOUT: Duration = Duration.ofMillis(1500)
+        private val REQUEST_TIMEOUT: Duration = Duration.ofMillis(1200)
         private const val UPDATE_RETRY_ATTEMPTS = 5
     }
 
     private val accountName = properties.accountName
     private val serviceName = properties.serviceName
+
+    private val circuitBreakerConfig: CircuitBreakerConfig = CircuitBreakerConfig.custom()
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .slidingWindowSize(20)
+
+        .failureRateThreshold(30f)
+        .slowCallRateThreshold(50f)
+        .slowCallDurationThreshold(Duration.ofMillis(400))
+
+        .minimumNumberOfCalls(5)
+
+        .waitDurationInOpenState(Duration.ofMillis(1500))
+
+        .permittedNumberOfCallsInHalfOpenState(3)
+
+        .automaticTransitionFromOpenToHalfOpenEnabled(true)
+
+        .recordExceptions(
+            SocketTimeoutException::class.java,
+            java.net.ConnectException::class.java,
+            java.io.IOException::class.java
+        )
+
+        .ignoreExceptions(
+            IllegalArgumentException::class.java
+        )
+        .build()
+
+    private val circuitBreakerRegistry = CircuitBreakerRegistry.of(circuitBreakerConfig)
+    private val circuitBreaker: CircuitBreaker = circuitBreakerRegistry.circuitBreaker("payment-$accountName")
+
+    init {
+        circuitBreaker.eventPublisher
+            .onStateTransition { event ->
+                logger.warn("Circuit Breaker [$accountName] state transition: ${event.stateTransition}")
+            }
+            .onFailureRateExceeded { event ->
+                logger.warn("Circuit Breaker [$accountName] failure rate exceeded: ${event.failureRate}%")
+            }
+            .onSlowCallRateExceeded { event ->
+                logger.warn("Circuit Breaker [$accountName] slow call rate exceeded: ${event.slowCallRate}%")
+            }
+    }
 
     private val scheduler: ScheduledExecutorService =
         Executors.newScheduledThreadPool(4, NamedThreadFactory("payment-hedge-$accountName"))
@@ -135,7 +181,27 @@ class PaymentExternalSystemAdapterImpl(
             return result
         }
 
+        // Checking
+        if (!circuitBreaker.tryAcquirePermission()) {
+            incReq("primary", "circuit_open")
+            logger.debug("Circuit breaker OPEN for $accountName, rejecting payment $paymentId")
+            runDbAsync {
+                updateWithRetry(paymentId) { state ->
+                    state.logProcessing(
+                        success = false,
+                        processedAt = now(),
+                        transactionId = txId,
+                        reason = "circuit_breaker_open"
+                    )
+                }
+            }
+            result.complete(false)
+            return result
+        }
+
         if (!rateLimiter.tickBlocking(Duration.ofMillis(remainingMs))) {
+            circuitBreaker.releasePermission()
+
             incReq("primary", "rate_limited")
             runDbAsync {
                 updateWithRetry(paymentId) { state ->
@@ -154,6 +220,8 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         if (!acquired) {
+            circuitBreaker.releasePermission()
+
             incReq("primary", "semaphore_timeout")
             runDbAsync {
                 updateWithRetry(paymentId) { state ->
@@ -180,6 +248,7 @@ class PaymentExternalSystemAdapterImpl(
                 .build()
         }
 
+        val requestStartTime = now()
         val primary = sendAsync("primary", buildRequest())
         val hedge1 = CompletableFuture<HttpResponse<String>>()
         val hedge2 = CompletableFuture<HttpResponse<String>>()
@@ -206,10 +275,15 @@ class PaymentExternalSystemAdapterImpl(
                     return@whenComplete
                 }
 
+                val callDuration = now() - requestStartTime
+
                 if (ex != null) {
                     val cause = (ex as? CompletionException)?.cause ?: ex
                     val outcome = if (cause is SocketTimeoutException) "timeout" else "fail"
                     incReq(kind, outcome)
+
+                    // Write error
+                    circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, cause)
 
                     runDbAsync {
                         updateWithRetry(paymentId) { state ->
@@ -223,6 +297,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 if (resp == null) {
                     incReq(kind, "fail")
+                    circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, RuntimeException("empty_response"))
                     runDbAsync {
                         updateWithRetry(paymentId) { state ->
                             state.logProcessing(false, now(), txId, reason = "empty_response")
@@ -246,6 +321,10 @@ class PaymentExternalSystemAdapterImpl(
 
                 if (body.result) {
                     incReq(kind, "success")
+
+                    // Write success
+                    circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
+
                     if (completed.compareAndSet(false, true)) {
                         all.forEach { other ->
                             if (other !== f && !other.isDone) other.cancel(true)
@@ -254,6 +333,26 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 } else {
                     incReq(kind, "fail")
+
+                    // Check the reason of error
+                    val isExternalServiceError = body.message?.let { msg ->
+                        msg.contains("SERVICE_UNAVAILABLE", ignoreCase = true) ||
+                                msg.contains("GATEWAY_TIMEOUT", ignoreCase = true) ||
+                                msg.contains("503", ignoreCase = true) ||
+                                msg.contains("504", ignoreCase = true)
+                    } ?: false
+
+                    if (isExternalServiceError) {
+                        // Write as error
+                        circuitBreaker.onError(
+                            callDuration,
+                            TimeUnit.MILLISECONDS,
+                            RuntimeException(body.message ?: "external_service_error")
+                        )
+                    } else {
+                        circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
+                    }
+
                     if (now() > deadline) {
                         maybeFinishFalseIfAllDone(force = true)
                     } else {
@@ -271,11 +370,42 @@ class PaymentExternalSystemAdapterImpl(
                 if (!hedge1.isDone) hedge1.cancel(true)
                 return@schedule
             }
+            // CB - not closed -> hedge - off
+            if (circuitBreaker.state != CircuitBreaker.State.CLOSED) {
+                if (!hedge1.isDone) hedge1.cancel(true)
+                return@schedule
+            }
+            // Checking failure rate
+            val metrics = circuitBreaker.metrics
+            if (metrics.failureRate > 10f || metrics.slowCallRate > 20f) {
+                if (!hedge1.isDone) hedge1.cancel(true)
+                return@schedule
+            }
+            if (!circuitBreaker.tryAcquirePermission()) {
+                if (!hedge1.isDone) hedge1.cancel(true)
+                return@schedule
+            }
             completeWith(hedge1, sendAsync("hedge", buildRequest()))
         }, HEDGE1_DELAY_MS, TimeUnit.MILLISECONDS)
 
         scheduler.schedule({
             if (completed.get() || now() > deadline || primary.isDone || hedge1.isDone) {
+                if (!hedge2.isDone) hedge2.cancel(true)
+                return@schedule
+            }
+            // CB - not closed -> hedge - off
+            if (circuitBreaker.state != CircuitBreaker.State.CLOSED) {
+                if (!hedge2.isDone) hedge2.cancel(true)
+                return@schedule
+            }
+
+            // Checking failure rate
+            val metrics = circuitBreaker.metrics
+            if (metrics.failureRate > 10f || metrics.slowCallRate > 20f) {
+                if (!hedge2.isDone) hedge2.cancel(true)
+                return@schedule
+            }
+            if (!circuitBreaker.tryAcquirePermission()) {
                 if (!hedge2.isDone) hedge2.cancel(true)
                 return@schedule
             }
